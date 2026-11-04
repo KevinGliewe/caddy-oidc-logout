@@ -11,6 +11,26 @@ From the repository root:
 docker compose -f examples/keycloak/compose.yaml up --build -d
 ```
 
+To use a Caddy image published by the GitHub workflow, create a `.env` file in
+the repository root containing your Docker Hub image reference:
+
+```dotenv
+CADDY_IMAGE=your-dockerhub-user/caddy-oidc-logout:latest
+```
+
+Then build only the demonstration applications and pull the published Caddy:
+
+```sh
+docker compose -f examples/keycloak/compose.yaml build app1 app2
+docker compose -f examples/keycloak/compose.yaml pull caddy keycloak
+docker compose -f examples/keycloak/compose.yaml up --no-build -d
+```
+
+This runs the same example with the published image. The Caddy service's `build`
+configuration remains available for local development; `--no-build` keeps this
+run on the selected published image. Use a version tag or digest instead of
+`latest` to pin a particular build.
+
 Open <http://apps.localtest.me:8088/app1/> or
 <http://apps.localtest.me:8088/app2/>. `*.localtest.me` resolves to `127.0.0.1`.
 If your DNS blocks loopback answers, add this local hosts entry:

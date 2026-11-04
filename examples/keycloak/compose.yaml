@@ -23,6 +23,7 @@ services:
       retries: 30
 
   caddy:
+    image: ${CADDY_IMAGE:-caddy-oidc-logout:local}
     build:
       context: ../..
     environment:
