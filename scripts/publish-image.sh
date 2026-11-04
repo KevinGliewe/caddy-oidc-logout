@@ -31,7 +31,9 @@ esac
 if [[ $mode == tags ]]; then printf '%s\n' "${tags[@]}"; exit 0; fi
 [[ -n ${DOCKERHUB_USERNAME:-} ]] || die 'Set the DOCKERHUB_USERNAME repository secret'
 image=${DOCKERHUB_IMAGE:-${DOCKERHUB_USERNAME,,}/caddy-oidc-logout}
-[[ $image =~ ^[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]] || die 'DOCKERHUB_IMAGE must be a lowercase Docker Hub namespace/repository'
+# Dots and the literal localhost in the first component would select a
+# different registry in Docker, even though the value contains just one slash.
+[[ $image =~ ^[a-z0-9]+([_-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ && $image != localhost/* ]] || die 'DOCKERHUB_IMAGE must be a lowercase Docker Hub namespace/repository'
 if [[ $mode == check ]]; then
     [[ -n ${DOCKERHUB_TOKEN:-} ]] || die 'Set the DOCKERHUB_TOKEN repository secret'
     printf 'Docker Hub publication configuration is valid.\n'

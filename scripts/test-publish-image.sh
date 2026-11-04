@@ -202,7 +202,8 @@ for missing in DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
     assert_no_calls
     pass
 done
-for image in Example/image registry.example.com/acme/image acme/image:latest \
+for image in Example/image registry.example.com/acme/image registry.example.com/acme \
+    localhost/image acme/image:latest \
     acme/image/extra 'acme/$(touch injected)' $'acme/image\nother/image'; do
     new_case "reject-image-$passed"
     run_publisher failure check "DOCKERHUB_IMAGE=$image"
