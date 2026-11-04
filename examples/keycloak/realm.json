@@ -1,0 +1,84 @@
+{
+  "realm": "company",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 3600,
+  "roles": {
+    "realm": [
+      {"name": "app1-admin", "description": "Access to Application 1"},
+      {"name": "app2-admin", "description": "Access to Application 2"}
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "caddy",
+      "name": "Caddy gateway",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "example-client-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "frontchannelLogout": false,
+      "redirectUris": ["http://apps.localtest.me:8088/oauth2/callback"],
+      "webOrigins": ["http://apps.localtest.me:8088"],
+      "attributes": {
+        "backchannel.logout.url": "http://apps.localtest.me:8088/_oidc/backchannel",
+        "backchannel.logout.session.required": "true",
+        "post.logout.redirect.uris": "http://apps.localtest.me:8088/logged-out",
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm-roles-in-id-token",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "demo-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "demo-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "alice", "email": "alice@example.test", "emailVerified": true,
+      "firstName": "Alice", "lastName": "Example", "enabled": true,
+      "credentials": [{"type": "password", "value": "example-password", "temporary": false}],
+      "realmRoles": ["app1-admin"]
+    },
+    {
+      "username": "bob", "email": "bob@example.test", "emailVerified": true,
+      "firstName": "Bob", "lastName": "Example", "enabled": true,
+      "credentials": [{"type": "password", "value": "example-password", "temporary": false}],
+      "realmRoles": ["app2-admin"]
+    },
+    {
+      "username": "charlie", "email": "charlie@example.test", "emailVerified": true,
+      "firstName": "Charlie", "lastName": "Example", "enabled": true,
+      "credentials": [{"type": "password", "value": "example-password", "temporary": false}],
+      "realmRoles": ["app1-admin", "app2-admin"]
+    }
+  ]
+}
