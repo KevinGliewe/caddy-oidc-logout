@@ -153,6 +153,11 @@ run_publisher success tags GITHUB_REF=refs/tags/v1.2.3-rc.1
 assert_tags "sha-$sha" 1.2.3-rc.1
 pass
 
+new_case valid-numeric-and-alphanumeric-prerelease
+run_publisher success tags GITHUB_REF=refs/tags/v1.2.3-0.01a.rc.10
+assert_tags "sha-$sha" 1.2.3-0.01a.rc.10
+pass
+
 for event in pull_request pull_request_target; do
     new_case "reject-$event"
     run_publisher failure publish "GITHUB_EVENT_NAME=$event"
@@ -174,6 +179,12 @@ for invalid_sha in short AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
     assert_no_calls
     pass
 done
+
+new_case reject-oversized-release
+printf -v long_identifier '%0130d' 0
+run_publisher failure publish "GITHUB_REF=refs/tags/v1.2.3-rc$long_identifier"
+assert_no_calls
+pass
 
 new_case valid-credentials
 run_publisher success check
@@ -208,6 +219,11 @@ pass
 
 new_case wrong-second-platform
 run_publisher failure publish MOCK_PLATFORM_ARM64=linux/amd64
+assert_no_push
+pass
+
+new_case wrong-second-operating-system
+run_publisher failure publish MOCK_PLATFORM_ARM64=windows/arm64
 assert_no_push
 pass
 
