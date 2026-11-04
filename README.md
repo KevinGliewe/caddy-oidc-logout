@@ -20,6 +20,88 @@ Open <http://apps.localtest.me:8088/app1/> or
 Keycloak settings and automated verification. The example includes one Caddy,
 one Keycloak realm and two JWT-validating WebSocket applications.
 
+## Published Docker image
+
+The **Build, test and publish Caddy** GitHub Actions workflow builds native
+`linux/amd64` and `linux/arm64` images. Each image passes the runtime smoke check
+and the real Keycloak integration test before publication. The publish job
+promotes those tested images without rebuilding them and creates one
+multi-platform image tag. Docker selects the matching architecture when pulling.
+
+Configure these repository Actions secrets:
+
+| Secret | Value |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | Docker Hub login username |
+| `DOCKERHUB_TOKEN` | Docker Hub access token with permission to push the image |
+
+The default destination is `<DOCKERHUB_USERNAME>/caddy-oidc-logout`. To publish
+under another Docker Hub namespace or repository, set the repository Actions
+variable `DOCKERHUB_IMAGE` to `namespace/repository`; the login account must have
+push access there. Choose the Docker Hub repository's visibility in Docker Hub.
+
+| Trigger | Published tags |
+| --- | --- |
+| Successful push to `main` | `latest` and `sha-<full-commit-sha>` |
+| Git tag `v1.2.3` | `1.2.3` and `sha-<full-commit-sha>` |
+| Git tag `v1.2.3-rc.1` | `1.2.3-rc.1` and `sha-<full-commit-sha>` |
+| Manual workflow dispatch on `main` | Same tags as a main-branch build |
+| Pull request | Build and test only; no Docker Hub login or push |
+
+Version tags do not change `latest`, which follows validated `main` builds.
+Use a version or commit tag for a chosen build, or pin the published digest for
+an immutable image reference. An image is available after the publish job
+finishes successfully. The workflow publishes the image to Docker Hub; running
+it on your server uses the Compose setup below.
+
+### Run the published image on your server
+
+Create `compose.yaml` next to your `Caddyfile`:
+
+```yaml
+services:
+  caddy:
+    image: ${CADDY_IMAGE:?Set CADDY_IMAGE in .env}
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?Set OIDC_CLIENT_SECRET in .env}
+      COOKIE_SECRET: ${COOKIE_SECRET:?Set COOKIE_SECRET in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:
+```
+
+Create `.env` with your image name and real secrets:
+
+```dotenv
+CADDY_IMAGE=your-dockerhub-user/caddy-oidc-logout:latest
+OIDC_CLIENT_SECRET=your-oidc-client-secret
+COOKIE_SECRET=replace-with-a-random-64-byte-secret
+```
+
+Configure the realm, domains and upstreams in the Caddyfile as described below.
+The application upstreams must be reachable from the Caddy container; services
+in the same Compose project can be addressed by their service names. Then run:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+Keep the data volumes and cookie secret when updating the image. They preserve
+certificates, encrypted tokens and session revocations. The image already
+contains Caddy, OIDC authentication, our logout module and the token-storage
+extension; no plugin installation is needed on the server.
+
 ## Build
 
 The repository pins Caddy **v2.11.8** and `caddy-oidc` **v0.4.3**. Go 1.26 is
@@ -223,6 +305,12 @@ go vet ./...
 (cd .build/oidc && go test ./...)
 docker compose -f examples/keycloak/compose.yaml up --build -d
 go run ./examples/e2e
+```
+
+The image smoke check can also be run independently:
+
+```sh
+./scripts/test-image.sh caddy-oidc-logout:local
 ```
 
 Unit and integration tests cover logout JWT validation, invalid forms, browser

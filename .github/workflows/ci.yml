@@ -1,17 +1,27 @@
-name: CI
+name: Build, test and publish Caddy
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: caddy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.10'
+      - run: ./scripts/test-publish-image.sh
       - run: ./scripts/prepare-oidc.sh
       - run: go test -race ./...
       - run: go vet ./...
@@ -19,18 +29,102 @@ jobs:
       - run: go build -trimpath -o bin/caddy ./cmd/caddy
       - run: bin/caddy adapt --config examples/keycloak/Caddyfile --pretty > /tmp/caddy.json
       - run: docker compose -f examples/keycloak/compose.yaml config --quiet
-  keycloak:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  images:
+    name: Image and Keycloak (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      CADDY_IMAGE: caddy-oidc-logout:test-${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.10'
       - run: ./scripts/prepare-oidc.sh
-      - run: docker compose -f examples/keycloak/compose.yaml up --build -d
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the image to be tested and published
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          tags: ${{ env.CADDY_IMAGE }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.title=Caddy OIDC Logout
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=caddy-${{ matrix.arch }}
+          cache-to: type=gha,scope=caddy-${{ matrix.arch }},mode=max
+      - name: Verify Caddy, modules, config and HTTP server
+        run: ./scripts/test-image.sh "$CADDY_IMAGE"
+      - name: Start Keycloak and backends with the prebuilt Caddy image
+        run: |
+          docker compose -f examples/keycloak/compose.yaml build app1 app2
+          docker compose -f examples/keycloak/compose.yaml up --no-build --wait --wait-timeout 180
       - run: go run ./examples/e2e
+      - name: Save the tested image
+        env:
+          IMAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p image-artifacts
+          docker save "$CADDY_IMAGE" | gzip > "image-artifacts/caddy-${IMAGE_ARCH}.tar.gz"
+      - name: Upload the tested image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: caddy-image-${{ matrix.arch }}
+          path: image-artifacts/caddy-${{ matrix.arch }}.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
       - if: failure()
         run: docker compose -f examples/keycloak/compose.yaml logs --tail=100
       - if: always()
         run: docker compose -f examples/keycloak/compose.yaml down -v
+  publish:
+    name: Publish tested images to Docker Hub
+    needs: [test, images]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: dockerhub-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check Docker Hub credentials and image name
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        run: ./scripts/publish-image.sh check
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: caddy-image-*
+          path: image-artifacts
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to Docker Hub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Promote the exact tested images and create the multi-platform tags
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/publish-image.sh publish
