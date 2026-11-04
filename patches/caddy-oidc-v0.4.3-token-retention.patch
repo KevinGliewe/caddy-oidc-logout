@@ -1,0 +1,892 @@
+diff --git a/authenticator/cookie.go b/authenticator/cookie.go
+index df13a30..42ec386 100644
+--- a/authenticator/cookie.go
++++ b/authenticator/cookie.go
+@@ -2,17 +2,21 @@ package authenticator
+ 
+ import (
+ 	"context"
++	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+ 	"slices"
++	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/caddyserver/caddy/v2"
+ 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+ 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
++	"github.com/caddyserver/certmagic"
+ 	"github.com/coreos/go-oidc/v3/oidc"
+ 	"github.com/google/uuid"
+ 	"github.com/gorilla/securecookie"
+@@ -149,9 +153,16 @@ type SessionCookieAuthenticator struct {
+ 	// When set, the browser cookie uses Max-Age and session ExpiresAt is set to
+ 	// now+MaxAge (cookie sessions do not re-validate the access token).
+ 	MaxAge caddy.Duration `json:"max_age,omitempty"`
+-
+-	secure      *securecookie.SecureCookie
+-	redirectURL *url.URL
++	// RetainAccessToken stores encrypted provider tokens in Caddy storage for
++	// trusted downstream middleware. Cookies contain only an opaque reference.
++	// Sessions cannot outlive either retained token.
++	RetainAccessToken bool `json:"retain_access_token,omitempty"`
++
++	secure           *securecookie.SecureCookie
++	redirectURL      *url.URL
++	tokenCodec       *securecookie.SecureCookie
++	tokenStorage     certmagic.Storage
++	lastTokenCleanup atomic.Int64
+ }
+ 
+ func (*SessionCookieAuthenticator) CaddyModule() caddy.ModuleInfo {
+@@ -216,6 +227,11 @@ func (au *SessionCookieAuthenticator) unmarshalCookieDirective(d *caddyfile.Disp
+ 		}
+ 	case "max_age":
+ 		return au.unmarshalMaxAge(d)
++	case "retain_access_token":
++		if d.NextArg() {
++			return d.ArgErr()
++		}
++		au.RetainAccessToken = true
+ 	default:
+ 		return d.Errf("unrecognized cookie subdirective: %s", d.Val())
+ 	}
+@@ -253,7 +269,7 @@ func (au *SessionCookieAuthenticator) unmarshalMaxAge(d *caddyfile.Dispenser) er
+ 	return nil
+ }
+ 
+-func (au *SessionCookieAuthenticator) Provision(_ caddy.Context) error {
++func (au *SessionCookieAuthenticator) Provision(ctx caddy.Context) error {
+ 	repl := caddy.NewReplacer()
+ 
+ 	var err error
+@@ -301,6 +317,18 @@ func (au *SessionCookieAuthenticator) Provision(_ caddy.Context) error {
+ 	// Do not restrict max age of the cookie at the securecookie level,
+ 	// as we will validate the session expiration time as part of the session payload.
+ 	au.secure.MaxAge(0)
++	if au.RetainAccessToken {
++		au.tokenCodec = securecookie.New(hashKey, blockKey)
++		au.tokenCodec.SetSerializer(&securecookie.JSONEncoder{})
++		au.tokenCodec.MaxLength(maxRetainedTokenRecordSize)
++		au.tokenCodec.MaxAge(0)
++		if au.tokenStorage == nil {
++			au.tokenStorage = ctx.Storage()
++		}
++		if au.tokenStorage == nil {
++			return errors.New("token retention requires Caddy storage")
++		}
++	}
+ 
+ 	if au.RedirectURL == "" {
+ 		au.RedirectURL = defaultRedirectURL
+@@ -356,6 +384,24 @@ func (au *SessionCookieAuthenticator) AuthenticateRequest(cfg OIDCConfiguration,
+ 		return nil, err
+ 	}
+ 
++	if au.RetainAccessToken {
++		if s.TokenRef == "" || s.ExpiresAt == 0 {
++			return nil, ErrNoAuthentication
++		}
++		// A forwarded credential must not benefit from the general cookie clock
++		// leeway: an expired access token must never reach the backend.
++		if !cfg.Now().Before(s.Expires()) {
++			return nil, &oidc.TokenExpiredError{Expiry: s.Expires()}
++		}
++		if err := au.loadRetainedTokens(r.Context(), &s, cfg.Now()); err != nil {
++			return nil, err
++		}
++	} else {
++		// Disabling retention also suppresses tokens from previously issued cookies.
++		s.AccessToken = ""
++		s.IDToken = ""
++	}
++
+ 	return &s, nil
+ }
+ 
+@@ -514,11 +560,55 @@ func (au *SessionCookieAuthenticator) handleCodeExchange(
+ 		return nil, fmt.Errorf("failed to marshal session claims: %w", err)
+ 	}
+ 
+-	return &session.Session{
++	s := &session.Session{
+ 		UID:       uid,
+ 		Claims:    sessionClaimsJSON,
+ 		ExpiresAt: expiresAt.Unix(),
+-	}, nil
++	}
++	if au.RetainAccessToken {
++		if response.AccessToken == "" || strings.IndexFunc(response.AccessToken, func(r rune) bool {
++			return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("-._~+/=", r))
++		}) >= 0 {
++			return nil, errors.New("cannot retain missing or malformed access token")
++		}
++		if !strings.EqualFold(response.Type(), "Bearer") {
++			return nil, errors.New("retained access token must use the Bearer token type")
++		}
++		if response.Expiry.IsZero() || !response.Expiry.After(cfg.Now()) {
++			return nil, errors.New("retained access token requires a future expiry")
++		}
++		// max_age must never extend a retained credential beyond either token's
++		// lifetime. No refresh token is stored; expiry starts a new OIDC flow.
++		if idToken.Expiry.Before(expiresAt) {
++			expiresAt = idToken.Expiry
++		}
++		if response.Expiry.Before(expiresAt) {
++			expiresAt = response.Expiry
++		}
++		// A JWT's absolute exp can precede the expires_in-derived OAuth expiry
++		// because of network delay. Decoding here can only shorten validity;
++		// the credential still comes from the authenticated token response.
++		if parts := strings.Split(response.AccessToken, "."); len(parts) == 3 {
++			if payload, err := base64.RawURLEncoding.DecodeString(parts[1]); err == nil {
++				var claims map[string]json.RawMessage
++				if json.Unmarshal(payload, &claims) == nil {
++					if rawExpiry, ok := claims["exp"]; ok {
++						var unixExpiry int64
++						if json.Unmarshal(rawExpiry, &unixExpiry) != nil || unixExpiry <= cfg.Now().Unix() {
++							return nil, errors.New("retained access JWT requires a valid future exp")
++						}
++						if jwtExpiry := time.Unix(unixExpiry, 0); jwtExpiry.Before(expiresAt) {
++							expiresAt = jwtExpiry
++						}
++					}
++				}
++			}
++		}
++		s.ExpiresAt = expiresAt.Unix()
++		s.AccessToken = response.AccessToken
++		s.IDToken, _ = response.Extra("id_token").(string)
++	}
++	return s, nil
+ }
+ 
+ // IsCallbackURL returns true if the request is a callback from the authorization endpoint.
+@@ -549,12 +639,24 @@ func (au *SessionCookieAuthenticator) HandleCallback(cfg OAuthAuthorizationFlowC
+ 		return caddyhttp.Error(http.StatusBadRequest, err)
+ 	}
+ 
++	if au.RetainAccessToken {
++		if err := au.storeRetainedTokens(r.Context(), s, cfg.Now()); err != nil {
++			return fmt.Errorf("failed to retain provider tokens: %w", err)
++		}
++	}
++
+ 	cookieValue, err := au.secure.Encode(au.Name, s)
+ 	if err != nil {
++		au.deleteRetainedTokens(r.Context(), s)
+ 		return fmt.Errorf("failed to encode session cookie: %w", err)
+ 	}
+ 
+-	http.SetCookie(rw, au.NewCookie(cookieValue))
++	cookie := au.NewCookie(cookieValue)
++	if len(cookie.String()) > 4096 {
++		au.deleteRetainedTokens(r.Context(), s)
++		return errors.New("session exceeds the browser cookie size limit; reduce retained claims or tokens")
++	}
++	http.SetCookie(rw, cookie)
+ 
+ 	// Redirect to the configured redirect URI
+ 	var redirectURI = csrfToken.RedirectURI
+diff --git a/authenticator/cookie_retention_test.go b/authenticator/cookie_retention_test.go
+new file mode 100644
+index 0000000..35f1b83
+--- /dev/null
++++ b/authenticator/cookie_retention_test.go
+@@ -0,0 +1,174 @@
++package authenticator
++
++import (
++	"context"
++	"encoding/base64"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/caddyserver/caddy/v2"
++	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
++	"github.com/caddyserver/certmagic"
++	"github.com/relvacode/caddy-oidc/internal/pkgtest"
++	"github.com/relvacode/caddy-oidc/session"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/oauth2"
++)
++
++type retainedTokenConfiguration struct {
++	testHandleCallbackConfiguration
++	token *oauth2.Token
++}
++
++func (cfg *retainedTokenConfiguration) Exchange(context.Context, string, ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
++	return cfg.token, nil
++}
++
++func retainedFixture(t *testing.T, retain bool, maxAge time.Duration, tokenExpiry, idExpiry time.Time) (*SessionCookieAuthenticator, *retainedTokenConfiguration) {
++	t.Helper()
++	au := &SessionCookieAuthenticator{
++		Name: "caddy", Secret: strings.Repeat("s", 64),
++		RetainAccessToken: retain, MaxAge: caddy.Duration(maxAge),
++		IDClaims:     []string{"iss", "sub", "exp"},
++		tokenStorage: &certmagic.FileStorage{Path: t.TempDir()},
++	}
++	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
++	t.Cleanup(cancel)
++	require.NoError(t, au.Provision(ctx))
++	cfg := &retainedTokenConfiguration{
++		testHandleCallbackConfiguration: testHandleCallbackConfiguration{
++			userInfo: newTestUserInfo(t, `{"sub":"test"}`),
++		},
++		token: (&oauth2.Token{AccessToken: "original.access.jwt", TokenType: "Bearer", Expiry: tokenExpiry}).WithExtra(map[string]any{
++			"id_token": pkgtest.GenerateTestJWTExpiresAt(idExpiry),
++		}),
++	}
++	return au, cfg
++}
++
++func TestRetainedCredentialsAreOptionalAndBoundToTokenExpiry(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	for _, tt := range []struct {
++		name                                 string
++		retain                               bool
++		maxAge, accessLife, idLife, wantLife time.Duration
++	}{
++		{"default discards credentials", false, 0, time.Minute, time.Hour, time.Hour},
++		{"access expiry", true, 0, time.Minute, time.Hour, time.Minute},
++		{"ID expiry", true, 0, time.Hour, time.Minute, time.Minute},
++		{"max age cannot extend token", true, 24 * time.Hour, time.Minute, time.Hour, time.Minute},
++		{"max age can shorten token", true, time.Minute, time.Hour, time.Hour, time.Minute},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			au, cfg := retainedFixture(t, tt.retain, tt.maxAge, now.Add(tt.accessLife), now.Add(tt.idLife))
++			s, err := au.handleCodeExchange(cfg, pkgtest.NewRequest(http.MethodGet, "/oauth2/callback?code=code", nil), "verifier")
++			require.NoError(t, err)
++			require.Equal(t, now.Add(tt.wantLife).Unix(), s.ExpiresAt)
++			if tt.retain {
++				require.Equal(t, cfg.token.AccessToken, s.AccessToken)
++				require.Equal(t, cfg.token.Extra("id_token"), s.IDToken)
++				require.NoError(t, au.storeRetainedTokens(context.Background(), s, now))
++				encoded, err := au.secure.Encode(au.Name, s)
++				require.NoError(t, err)
++				require.NotContains(t, encoded, s.AccessToken)
++				r := pkgtest.NewRequest(http.MethodGet, "/", nil)
++				r.AddCookie(au.NewCookie(encoded))
++				restored, err := au.AuthenticateRequest(cfg, r)
++				require.NoError(t, err)
++				require.Equal(t, s.AccessToken, restored.AccessToken)
++				require.Equal(t, s.IDToken, restored.IDToken)
++			} else {
++				require.Empty(t, s.AccessToken)
++				require.Empty(t, s.IDToken)
++			}
++			require.NotContains(t, string(s.Claims), "original.access.jwt")
++		})
++	}
++}
++
++func TestRetainedCredentialsRejectUnusableAccessTokens(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	for _, tc := range []struct {
++		name   string
++		mutate func(*oauth2.Token)
++	}{
++		{"missing", func(t *oauth2.Token) { t.AccessToken = "" }},
++		{"header injection", func(t *oauth2.Token) { t.AccessToken = "token\r\nX-Injected: true" }},
++		{"non bearer", func(t *oauth2.Token) { t.TokenType = "MAC" }},
++		{"unknown expiry", func(t *oauth2.Token) { t.Expiry = time.Time{} }},
++		{"expired", func(t *oauth2.Token) { t.Expiry = now }},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			au, cfg := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++			tc.mutate(cfg.token)
++			_, err := au.handleCodeExchange(cfg, pkgtest.NewRequest(http.MethodGet, "/", nil), "v")
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestRetainedCredentialsRejectExpiryWithoutCookieLeeway(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, cfg := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	for _, s := range []*session.Session{
++		{UID: "test", AccessToken: "token", IDToken: "id", ExpiresAt: now.Unix()},
++		{UID: "test", AccessToken: "token", IDToken: "id", ExpiresAt: now.Add(-time.Second).Unix()},
++		{UID: "test", ExpiresAt: now.Add(time.Hour).Unix()},
++	} {
++		encoded, err := au.secure.Encode(au.Name, s)
++		require.NoError(t, err)
++		r := pkgtest.NewRequest(http.MethodGet, "/", nil)
++		r.AddCookie(au.NewCookie(encoded))
++		_, err = au.AuthenticateRequest(cfg, r)
++		require.Error(t, err)
++	}
++}
++
++func TestDisablingRetentionHidesPreviouslyStoredCredentials(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, cfg := retainedFixture(t, false, 0, now.Add(time.Hour), now.Add(time.Hour))
++	encoded, err := au.secure.Encode(au.Name, &session.Session{UID: "test", AccessToken: "token", IDToken: "id", ExpiresAt: now.Add(time.Hour).Unix()})
++	require.NoError(t, err)
++	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
++	r.AddCookie(au.NewCookie(encoded))
++	s, err := au.AuthenticateRequest(cfg, r)
++	require.NoError(t, err)
++	require.Empty(t, s.AccessToken)
++	require.Empty(t, s.IDToken)
++}
++
++func TestOversizedRetainedTokenCannotCreateSession(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, cfg := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	cfg.token.AccessToken = strings.Repeat("x", 65536)
++	state := "oversized"
++	csrfValue, err := au.secure.Encode(au.Name+"|"+state, &CSRFToken{PKCEVerifier: "verifier", RedirectURI: "/"})
++	require.NoError(t, err)
++	r := pkgtest.NewRequest(http.MethodGet, "/oauth2/callback?state="+state+"&code=code", nil)
++	r.AddCookie(&http.Cookie{Name: au.Name + "|" + state, Value: csrfValue})
++	w := httptest.NewRecorder()
++	require.Error(t, au.HandleCallback(cfg, w, r))
++	for _, c := range w.Result().Cookies() {
++		require.NotEqual(t, au.Name, c.Name)
++	}
++}
++
++func TestRetainAccessTokenCaddyfile(t *testing.T) {
++	var au SessionCookieAuthenticator
++	require.NoError(t, au.UnmarshalCaddyfile(caddyfile.NewTestDispenser("{\n retain_access_token\n}")))
++	require.True(t, au.RetainAccessToken)
++	require.Error(t, au.UnmarshalCaddyfile(caddyfile.NewTestDispenser("{\n retain_access_token unexpected\n}")))
++}
++
++func TestAccessJWTAbsoluteExpiryCapsOAuthRelativeExpiry(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, cfg := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	cfg.token.AccessToken = "header." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, now.Add(time.Minute).Unix()))) + ".signature"
++	s, err := au.handleCodeExchange(cfg, pkgtest.NewRequest(http.MethodGet, "/", nil), "v")
++	require.NoError(t, err)
++	require.Equal(t, now.Add(time.Minute).Unix(), s.ExpiresAt)
++}
+diff --git a/authenticator/token_store.go b/authenticator/token_store.go
+new file mode 100644
+index 0000000..b41dc6e
+--- /dev/null
++++ b/authenticator/token_store.go
+@@ -0,0 +1,177 @@
++package authenticator
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io/fs"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/relvacode/caddy-oidc/session"
++)
++
++const maxRetainedTokenRecordSize = 64 << 10
++
++type retainedTokenRecord struct {
++	AccessToken    string `json:"access_token"`
++	IDToken        string `json:"id_token"`
++	ExpiresAt      int64  `json:"expires_at"`
++	SessionBinding string `json:"session_binding"`
++}
++
++func tokenSessionBinding(s *session.Session) (string, error) {
++	// json.Marshal compacts RawMessage, making the binding stable through the
++	// cookie JSON encode/decode round-trip. Include all authenticated claims.
++	b, err := json.Marshal(struct {
++		UID       string
++		ExpiresAt int64
++		Claims    json.RawMessage
++	}{s.UID, s.ExpiresAt, s.Claims})
++	if err != nil {
++		return "", err
++	}
++	digest := sha256.Sum256(b)
++	return hex.EncodeToString(digest[:]), nil
++}
++
++func (au *SessionCookieAuthenticator) tokenNamespace() string {
++	digest := sha256.Sum256([]byte(au.Name + "\x00" + au.Domain + "\x00" + au.Path))
++	return "oidc/retained_tokens/" + hex.EncodeToString(digest[:])
++}
++
++func (au *SessionCookieAuthenticator) tokenKey(s *session.Session) (string, error) {
++	ref, err := hex.DecodeString(s.TokenRef)
++	if err != nil || len(ref) != 32 || s.TokenRef != strings.ToLower(s.TokenRef) || s.ExpiresAt <= 0 {
++		return "", ErrNoAuthentication
++	}
++	return au.tokenNamespace() + "/" + strconv.FormatInt(s.ExpiresAt, 10) + "/" + s.TokenRef, nil
++}
++
++func (au *SessionCookieAuthenticator) tokenPurpose(s *session.Session) string {
++	return "oidc-retained|" + au.Name + "|" + s.TokenRef
++}
++
++func (au *SessionCookieAuthenticator) storeRetainedTokens(ctx context.Context, s *session.Session, now time.Time) error {
++	if au.tokenStorage == nil || au.tokenCodec == nil {
++		return errors.New("retained token storage is unavailable")
++	}
++	if s.AccessToken == "" || s.IDToken == "" || !s.Expires().After(now) {
++		return errors.New("retained tokens require valid credentials and expiry")
++	}
++	binding, err := tokenSessionBinding(s)
++	if err != nil {
++		return err
++	}
++	var reference [32]byte
++	if _, err := rand.Read(reference[:]); err != nil {
++		return err
++	}
++	s.TokenRef = hex.EncodeToString(reference[:])
++	key, err := au.tokenKey(s)
++	if err != nil {
++		return err
++	}
++	encoded, err := au.tokenCodec.Encode(au.tokenPurpose(s), retainedTokenRecord{
++		AccessToken: s.AccessToken, IDToken: s.IDToken,
++		ExpiresAt: s.ExpiresAt, SessionBinding: binding,
++	})
++	if err != nil {
++		return fmt.Errorf("cannot encode retained token record: %w", err)
++	}
++	storeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++	if err := au.tokenStorage.Store(storeCtx, key, []byte(encoded)); err != nil {
++		return err
++	}
++	au.cleanupRetainedTokens(ctx, now)
++	return nil
++}
++
++func (au *SessionCookieAuthenticator) loadRetainedTokens(ctx context.Context, s *session.Session, now time.Time) error {
++	if au.tokenStorage == nil || au.tokenCodec == nil {
++		return errors.New("retained token storage is unavailable")
++	}
++	key, err := au.tokenKey(s)
++	if err != nil {
++		return err
++	}
++	loadCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
++	defer cancel()
++	encoded, err := au.tokenStorage.Load(loadCtx, key)
++	if err != nil {
++		if errors.Is(err, fs.ErrNotExist) {
++			return ErrNoAuthentication
++		}
++		return fmt.Errorf("cannot load retained token record: %w", err)
++	}
++	if len(encoded) > maxRetainedTokenRecordSize {
++		return ErrNoAuthentication
++	}
++	var record retainedTokenRecord
++	if au.tokenCodec.Decode(au.tokenPurpose(s), string(encoded), &record) != nil {
++		return ErrNoAuthentication
++	}
++	binding, err := tokenSessionBinding(s)
++	if err != nil {
++		return err
++	}
++	if record.AccessToken == "" || record.IDToken == "" || record.ExpiresAt != s.ExpiresAt || record.ExpiresAt <= now.Unix() || record.SessionBinding != binding {
++		return ErrNoAuthentication
++	}
++	s.AccessToken, s.IDToken = record.AccessToken, record.IDToken
++	return nil
++}
++
++func (au *SessionCookieAuthenticator) deleteRetainedTokens(ctx context.Context, s *session.Session) {
++	if au.tokenStorage == nil {
++		return
++	}
++	key, err := au.tokenKey(s)
++	if err != nil {
++		return
++	}
++	deleteCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
++	defer cancel()
++	_ = au.tokenStorage.Delete(deleteCtx, key)
++}
++
++func (au *SessionCookieAuthenticator) cleanupRetainedTokens(ctx context.Context, now time.Time) {
++	// Cleanup is optional maintenance, never part of deciding authentication.
++	// Expiry checks remain mandatory even when no subsequent login cleans disk.
++	last := au.lastTokenCleanup.Load()
++	if now.Unix()-last < 60 || !au.lastTokenCleanup.CompareAndSwap(last, now.Unix()) {
++		return
++	}
++	cleanupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
++	defer cancel()
++	prefix := au.tokenNamespace()
++	buckets, err := au.tokenStorage.List(cleanupCtx, prefix, false)
++	if err != nil {
++		return
++	}
++	deleted := 0
++	for _, bucket := range buckets {
++		if deleted >= 128 || cleanupCtx.Err() != nil {
++			return
++		}
++		if !strings.HasPrefix(bucket, prefix+"/") {
++			continue
++		}
++		suffix := strings.TrimPrefix(bucket, prefix+"/")
++		if strings.Contains(suffix, "/") {
++			continue
++		}
++		expiry, err := strconv.ParseInt(suffix, 10, 64)
++		if err != nil || expiry > now.Unix() {
++			continue
++		}
++		_ = au.tokenStorage.Delete(cleanupCtx, prefix+"/"+strconv.FormatInt(expiry, 10))
++		deleted++
++	}
++}
+diff --git a/authenticator/token_store_test.go b/authenticator/token_store_test.go
+new file mode 100644
+index 0000000..116adf8
+--- /dev/null
++++ b/authenticator/token_store_test.go
+@@ -0,0 +1,178 @@
++package authenticator
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/caddyserver/caddy/v2"
++	"github.com/caddyserver/certmagic"
++	"github.com/relvacode/caddy-oidc/internal/pkgtest"
++	"github.com/relvacode/caddy-oidc/session"
++	"github.com/stretchr/testify/require"
++)
++
++func tokenStoreSession(now time.Time, uid string) *session.Session {
++	return &session.Session{UID: uid, Claims: json.RawMessage(`{"iss":"https://issuer","sid":"s","sub":"` + uid + `"}`),
++		ExpiresAt: now.Add(time.Hour).Unix(), AccessToken: strings.Repeat("access", 2000), IDToken: "original.id.jwt"}
++}
++
++func reloadedAuthenticator(t *testing.T, au *SessionCookieAuthenticator) *SessionCookieAuthenticator {
++	t.Helper()
++	next := &SessionCookieAuthenticator{Name: au.Name, Secret: au.Secret, Path: au.Path, Domain: au.Domain,
++		RetainAccessToken: true, tokenStorage: au.tokenStorage}
++	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
++	t.Cleanup(cancel)
++	require.NoError(t, next.Provision(ctx))
++	return next
++}
++
++func TestTokensPersistEncryptedOutsideCookieAcrossProvision(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, cfg := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	s := tokenStoreSession(now, "alice")
++	require.NoError(t, au.storeRetainedTokens(context.Background(), s, now))
++	require.Len(t, s.TokenRef, 64)
++	plainCookie, err := json.Marshal(s)
++	require.NoError(t, err)
++	require.NotContains(t, string(plainCookie), s.AccessToken)
++	require.NotContains(t, string(plainCookie), s.IDToken)
++	cookie, err := au.secure.Encode(au.Name, s)
++	require.NoError(t, err)
++	require.Less(t, len(cookie), 4096)
++	key, err := au.tokenKey(s)
++	require.NoError(t, err)
++	encrypted, err := au.tokenStorage.Load(context.Background(), key)
++	require.NoError(t, err)
++	require.NotContains(t, string(encrypted), s.AccessToken)
++	require.NotContains(t, string(encrypted), s.IDToken)
++	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
++	r.AddCookie(au.NewCookie(cookie))
++	restored, err := reloadedAuthenticator(t, au).AuthenticateRequest(cfg, r)
++	require.NoError(t, err)
++	require.Equal(t, s.AccessToken, restored.AccessToken)
++	require.Equal(t, s.IDToken, restored.IDToken)
++}
++
++func TestTokenRecordCannotBeSwappedBetweenIdentities(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, _ := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	a, b := tokenStoreSession(now, "alice"), tokenStoreSession(now, "bob")
++	require.NoError(t, au.storeRetainedTokens(context.Background(), a, now))
++	require.NoError(t, au.storeRetainedTokens(context.Background(), b, now))
++	a.TokenRef = b.TokenRef
++	a.AccessToken, a.IDToken = "", ""
++	require.ErrorIs(t, au.loadRetainedTokens(context.Background(), a, now), ErrNoAuthentication)
++}
++
++func TestTamperedMissingRotatedAndExpiredRecordsFailClosed(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	for _, tc := range []string{"tampered", "missing", "rotated-key", "changed-expiry", "expired", "oversized"} {
++		t.Run(tc, func(t *testing.T) {
++			au, _ := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++			s := tokenStoreSession(now, "alice")
++			require.NoError(t, au.storeRetainedTokens(context.Background(), s, now))
++			key, err := au.tokenKey(s)
++			require.NoError(t, err)
++			checkTime := now
++			switch tc {
++			case "tampered":
++				data, err := au.tokenStorage.Load(context.Background(), key)
++				require.NoError(t, err)
++				data[len(data)/2] ^= 1
++				require.NoError(t, au.tokenStorage.Store(context.Background(), key, data))
++			case "missing":
++				require.NoError(t, au.tokenStorage.Delete(context.Background(), key))
++			case "rotated-key":
++				au.Secret = strings.Repeat("r", 64)
++				au = reloadedAuthenticator(t, au)
++			case "changed-expiry":
++				data, err := au.tokenStorage.Load(context.Background(), key)
++				require.NoError(t, err)
++				s.ExpiresAt++
++				newKey, err := au.tokenKey(s)
++				require.NoError(t, err)
++				require.NoError(t, au.tokenStorage.Store(context.Background(), newKey, data))
++			case "expired":
++				checkTime = s.Expires()
++			case "oversized":
++				require.NoError(t, au.tokenStorage.Store(context.Background(), key, []byte(strings.Repeat("x", maxRetainedTokenRecordSize+1))))
++			}
++			s.AccessToken, s.IDToken = "", ""
++			require.Error(t, au.loadRetainedTokens(context.Background(), s, checkTime))
++			require.Empty(t, s.AccessToken)
++			require.Empty(t, s.IDToken)
++		})
++	}
++}
++
++func TestExpiredTokenCleanupIsBoundedAndPreservesActiveRecords(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, _ := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	for n := range 130 {
++		key := au.tokenNamespace() + "/" + strconv.FormatInt(now.Unix()-int64(n)-1, 10) + "/record"
++		require.NoError(t, au.tokenStorage.Store(context.Background(), key, []byte("expired")))
++	}
++	liveKey := au.tokenNamespace() + "/" + strconv.FormatInt(now.Add(time.Hour).Unix(), 10) + "/live"
++	require.NoError(t, au.tokenStorage.Store(context.Background(), liveKey, []byte("active")))
++	au.cleanupRetainedTokens(context.Background(), now)
++	keys, err := au.tokenStorage.List(context.Background(), au.tokenNamespace(), false)
++	require.NoError(t, err)
++	require.Len(t, keys, 3)
++	require.True(t, au.tokenStorage.Exists(context.Background(), liveKey))
++	au.cleanupRetainedTokens(context.Background(), now.Add(61*time.Second))
++	keys, err = au.tokenStorage.List(context.Background(), au.tokenNamespace(), false)
++	require.NoError(t, err)
++	require.Len(t, keys, 1)
++}
++
++type failingTokenStorage struct{ certmagic.Storage }
++
++func (f failingTokenStorage) Store(context.Context, string, []byte) error {
++	return errors.New("storage unavailable")
++}
++
++func TestTokenStorageFailurePreventsCookieIssuance(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, cfg := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	au.tokenStorage = failingTokenStorage{au.tokenStorage}
++	w := runRetainedCallback(t, au, cfg)
++	for _, c := range w.Result().Cookies() {
++		require.NotEqual(t, au.Name, c.Name)
++	}
++}
++
++func runRetainedCallback(t *testing.T, au *SessionCookieAuthenticator, cfg *retainedTokenConfiguration) *httptest.ResponseRecorder {
++	t.Helper()
++	csrf, err := au.secure.Encode(au.Name+"|state", &CSRFToken{PKCEVerifier: "v", RedirectURI: "/"})
++	require.NoError(t, err)
++	r := pkgtest.NewRequest(http.MethodGet, "/oauth2/callback?state=state&code=code", nil)
++	r.AddCookie(&http.Cookie{Name: au.Name + "|state", Value: csrf})
++	w := httptest.NewRecorder()
++	require.Error(t, au.HandleCallback(cfg, w, r))
++	return w
++}
++
++func TestFailedCookieEncodingDeletesStoredRecord(t *testing.T) {
++	now := (&pkgtest.TestOIDCConfiguration{}).Now()
++	au, cfg := retainedFixture(t, true, 0, now.Add(time.Hour), now.Add(time.Hour))
++	au.Claims = []string{"huge"}
++	cfg.userInfo = newTestUserInfo(t, `{"sub":"test","huge":"`+strings.Repeat("x", 4096)+`"}`)
++	w := runRetainedCallback(t, au, cfg)
++	for _, c := range w.Result().Cookies() {
++		require.NotEqual(t, au.Name, c.Name)
++	}
++	keys, err := au.tokenStorage.List(context.Background(), au.tokenNamespace(), true)
++	require.NoError(t, err)
++	for _, key := range keys {
++		info, err := au.tokenStorage.Stat(context.Background(), key)
++		require.NoError(t, err)
++		require.False(t, info.IsTerminal, "no orphan record should survive cookie issuance failure")
++	}
++}
+diff --git a/middleware.go b/middleware.go
+index f170e61..a2ec3fb 100644
+--- a/middleware.go
++++ b/middleware.go
+@@ -186,24 +186,24 @@ func (*OIDCMiddleware) setReplacerVars(repl *caddy.Replacer, session *session.Se
+ 
+ // interceptRequest intercepts the request and performs authentication and authorization checks.
+ // If returns "true" if the request was handled and a response was written.
+-func (mw *OIDCMiddleware) interceptRequest(rw http.ResponseWriter, r *http.Request) (bool, error) {
++func (mw *OIDCMiddleware) interceptRequest(rw http.ResponseWriter, r *http.Request) (bool, *http.Request, error) {
+ 	// Check if the request is an OAuth callback.
+ 	// Only supported if there is a session cookie authenticator configuration.
+ 	if r.Method == http.MethodGet {
+ 		cookie, ok := authenticator.GetAuthenticator[*authenticator.SessionCookieAuthenticator](&mw.provider.Authenticators)
+ 		if ok && cookie.IsCallbackURL(r) {
+-			return true, cookie.HandleCallback(mw.provider, rw, r)
++			return true, r, cookie.HandleCallback(mw.provider, rw, r)
+ 		}
+ 	}
+ 
+ 	// Check for supported well-knowns
+ 	if r.Method == http.MethodGet && r.URL.Path == WellKnownOAuthProtectedResourcePath {
+-		return true, mw.provider.ServeHTTPOAuthProtectedResource(rw, r)
++		return true, r, mw.provider.ServeHTTPOAuthProtectedResource(rw, r)
+ 	}
+ 
+ 	authMethod, s, err := mw.provider.Authenticators.AuthenticateRequest(mw.provider, r)
+ 	if err != nil {
+-		return false, err
++		return false, r, err
+ 	}
+ 
+ 	// Strip the request if configured
+@@ -222,7 +222,7 @@ func (mw *OIDCMiddleware) interceptRequest(rw http.ResponseWriter, r *http.Reque
+ 
+ 	result, err := mw.Policies.Evaluate(r)
+ 	if err != nil {
+-		return false, err
++		return false, r, err
+ 	}
+ 
+ 	if repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok {
+@@ -232,7 +232,7 @@ func (mw *OIDCMiddleware) interceptRequest(rw http.ResponseWriter, r *http.Reque
+ 
+ 	switch result.Result {
+ 	case EvaluationResultAllow:
+-		return false, nil
++		return false, r, nil
+ 	case EvaluationResultExplicitDeny:
+ 	case EvaluationResultImplicitDeny:
+ 		// If the evaluation result is an implicit reject, then check if the session is anonymous.
+@@ -243,7 +243,7 @@ func (mw *OIDCMiddleware) interceptRequest(rw http.ResponseWriter, r *http.Reque
+ 			if r.Method == http.MethodGet && request.IsBrowserInteractive(r) {
+ 				cookie, ok := authenticator.GetAuthenticator[*authenticator.SessionCookieAuthenticator](&mw.provider.Authenticators)
+ 				if ok {
+-					return true, cookie.StartLogin(mw.provider, rw, r)
++					return true, r, cookie.StartLogin(mw.provider, rw, r)
+ 				}
+ 			}
+ 
+@@ -251,11 +251,11 @@ func (mw *OIDCMiddleware) interceptRequest(rw http.ResponseWriter, r *http.Reque
+ 				rw.Header().Set("WWW-Authenticate", rs.WWWAuthenticate())
+ 			}
+ 
+-			return false, caddyhttp.Error(http.StatusUnauthorized, ErrAccessDenied)
++			return false, r, caddyhttp.Error(http.StatusUnauthorized, ErrAccessDenied)
+ 		}
+ 	}
+ 
+-	return false, caddyhttp.Error(http.StatusForbidden, ErrAccessDenied)
++	return false, r, caddyhttp.Error(http.StatusForbidden, ErrAccessDenied)
+ }
+ 
+ // ServeHTTP implements caddyhttp.MiddlewareHandler.
+@@ -263,7 +263,7 @@ func (mw *OIDCMiddleware) interceptRequest(rw http.ResponseWriter, r *http.Reque
+ // Without this, Caddy's error_directive does not properly set error replacer vars,
+ // which can result in HTTP 200 responses when it tries to parse `{err.status_code}`.
+ func (mw *OIDCMiddleware) ServeHTTP(rw http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+-	handled, err := mw.interceptRequest(rw, r)
++	handled, r, err := mw.interceptRequest(rw, r)
+ 	if err != nil {
+ 		var he caddyhttp.HandlerError
+ 		if !errors.As(err, &he) {
+diff --git a/middleware_context_test.go b/middleware_context_test.go
+new file mode 100644
+index 0000000..735ea7d
+--- /dev/null
++++ b/middleware_context_test.go
+@@ -0,0 +1,38 @@
++package caddy_oidc
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/caddyserver/caddy/v2"
++	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
++	"github.com/relvacode/caddy-oidc/authenticator"
++	"github.com/relvacode/caddy-oidc/internal/pkgtest"
++	"github.com/relvacode/caddy-oidc/session"
++	"github.com/stretchr/testify/require"
++)
++
++func TestAuthenticatedSessionContextReachesDownstream(t *testing.T) {
++	auth := &OIDCMiddleware{
++		provider: GenerateTestProvider(),
++		Policies: Ruleset{{Action: ActionAllow, Matchers: caddyhttp.MatcherSet{&MatchUser{Usernames: []string{"*"}}}}},
++	}
++	r := pkgtest.NewRequest(http.MethodGet, "/", nil)
++	r.Header.Set("Authorization", "Bearer "+pkgtest.GenerateTestJWTExpiresAt(auth.provider.Clock().Add(time.Hour)))
++	called := false
++	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
++		called = true
++		s, ok := r.Context().Value(SessionCtxKey).(*session.Session)
++		require.True(t, ok, "downstream middleware needs verified session context")
++		require.Equal(t, "test", s.UID)
++		require.Equal(t, authenticator.AuthMethodBearer, r.Context().Value(AuthMethodCtxKey))
++		repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
++		_, leaked := repl.Get("http.auth.access_token")
++		require.False(t, leaked, "credentials must not become logging placeholders")
++		return nil
++	})
++	require.NoError(t, auth.ServeHTTP(httptest.NewRecorder(), r, next))
++	require.True(t, called)
++}
+diff --git a/session/session.go b/session/session.go
+index fd3f8ce..affdf1f 100644
+--- a/session/session.go
++++ b/session/session.go
+@@ -37,6 +37,18 @@ type Session struct {
+ 	UID       string          `json:"u"`
+ 	ExpiresAt int64           `json:"e,omitempty"`
+ 	Claims    json.RawMessage `json:"c,omitempty"`
++	// TokenRef locates encrypted credentials in Caddy storage. Raw credentials
++	// exist only in memory after successful session authentication.
++	TokenRef    string `json:"tr,omitempty"`
++	AccessToken string `json:"-"`
++	IDToken     string `json:"-"`
++}
++
++// OIDCTokens exposes retained provider credentials only to trusted in-process
++// middleware. The interface lets consumers also work with unpatched versions
++// of caddy-oidc, where token retention is unavailable.
++func (s *Session) OIDCTokens() (accessToken, idToken string) {
++	return s.AccessToken, s.IDToken
+ }
+ 
+ // A ClaimsDecoder is an interface for decoding JWT claims into a target JSON-decodable object.

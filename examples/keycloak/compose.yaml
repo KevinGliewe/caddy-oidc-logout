@@ -1,0 +1,76 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    command: [start-dev, --import-realm]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: example-admin-password
+      KC_HOSTNAME: http://keycloak.localtest.me:8080
+      KC_HEALTH_ENABLED: "true"
+      NO_PROXY: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+      no_proxy: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./realm.json:/opt/keycloak/data/import/company.json:ro
+    networks:
+      default:
+        aliases: [keycloak.localtest.me]
+    healthcheck:
+      test: [CMD-SHELL, "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3; head -1 <&3 | grep -q '200'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  caddy:
+    build:
+      context: ../..
+    environment:
+      NO_PROXY: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+      no_proxy: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      default:
+        aliases: [apps.localtest.me]
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      app1:
+        condition: service_started
+      app2:
+        condition: service_started
+
+  app1:
+    build: ../backend
+    environment:
+      APP_NAME: Application 1
+      REQUIRED_ROLE: app1-admin
+      OIDC_ISSUER: http://keycloak.localtest.me:8080/realms/company
+      OIDC_AUDIENCE: demo-api
+      NO_PROXY: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+      no_proxy: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+  app2:
+    build: ../backend
+    environment:
+      APP_NAME: Application 2
+      REQUIRED_ROLE: app2-admin
+      OIDC_ISSUER: http://keycloak.localtest.me:8080/realms/company
+      OIDC_AUDIENCE: demo-api
+      NO_PROXY: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+      no_proxy: .localtest.me,keycloak,app1,app2,caddy,localhost,127.0.0.1
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+volumes:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,110 @@
+{
+	admin off
+	auto_https off
+
+	oidc company {
+		issuer http://keycloak.localtest.me:8080/realms/company
+		client_id caddy
+		client_secret example-client-secret
+		scope openid profile email
+		authenticate cookie {
+			name caddy
+			# Development key only: replace with a random 64-byte secret.
+			secret 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+			insecure
+			same_site lax
+			redirect_url /oauth2/callback
+			id_claim iss aud sub sid iat exp realm_access
+			retain_access_token
+		}
+	}
+
+	oidc_logout {
+		state_file /data/oidc-logout/sessions.db
+		max_session_age 24h
+		provider company {
+			issuer http://keycloak.localtest.me:8080/realms/company
+			client_id caddy
+			allow_insecure_issuer
+		}
+	}
+}
+
+http://apps.localtest.me:8088 {
+	handle /_oidc/backchannel {
+		oidc_backchannel company
+	}
+
+	handle /oauth2/callback {
+		oidc company {
+			allow {
+				user *
+			}
+		}
+		respond "Invalid callback" 400
+	}
+
+	handle /logout {
+		route {
+			oidc company {
+				allow {
+					user *
+				}
+			}
+			oidc_signout company {
+				cookie_name caddy
+				redirect http://apps.localtest.me:8088/logged-out
+			}
+		}
+	}
+
+	handle /logged-out {
+		respond "You are logged out. Open /app1/ or /app2/ to log in again."
+	}
+
+	handle /app1/* {
+		route {
+			oidc company {
+				allow {
+					user *
+					claim realm_access.roles app1-admin
+				}
+			}
+			oidc_session company {
+				forward_access_token
+			}
+			uri strip_prefix /app1
+			reverse_proxy app1:8080 {
+				transport oidc_session
+			}
+		}
+	}
+
+	handle /app2/* {
+		route {
+			oidc company {
+				allow {
+					user *
+					claim realm_access.roles app2-admin
+				}
+			}
+			oidc_session company {
+				forward_access_token
+			}
+			uri strip_prefix /app2
+			reverse_proxy app2:8080 {
+				transport oidc_session
+			}
+		}
+	}
+
+	handle /app1 {
+		redir /app1/ 308
+	}
+	handle /app2 {
+		redir /app2/ 308
+	}
+	handle {
+		respond "Open /app1/ or /app2/. See the example README for development accounts."
+	}
+}
