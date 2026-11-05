@@ -67,6 +67,7 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/huandu/go-clone v1.7.3 // indirect
 	github.com/huandu/xstrings v1.6.1 // indirect
+	github.com/icholy/replace v0.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
@@ -177,6 +178,7 @@ require (
 )
 
 require (
+	github.com/caddyserver/replace-response v0.0.0-20250618171559-80962887e4c6
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/relvacode/caddy-oidc v0.4.3

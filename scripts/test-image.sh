@@ -33,6 +33,7 @@ fi
 
 docker run --rm "$image" caddy list-modules > "$smoke_dir/modules"
 for module in \
+    http.handlers.replace_response \
     http.handlers.oidc \
     http.oidc.authenticators.cookie \
     http.handlers.oidc_session \
